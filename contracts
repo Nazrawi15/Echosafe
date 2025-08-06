@@ -25,4 +25,121 @@ makeIsDataIndexed ''Role [('Helper, 0), ('Counselor, 1), ('Admin, 2)]
 makeLift ''Role
 
 data Action = ViewLog | ReplyLog | UpgradeRole | SubmitEncryptedLog deriving (Show, Generic, FromJSON, ToJSON)
-makeIsDataIndexed ''Action [('ViewLog, 0), ('ReplyLog, 1), ('UpgradeRole, 2), ('SubmitEncryptedLog,
+makeIsDataIndexed ''Action [('ViewLog, 0), ('ReplyLog, 1), ('UpgradeRole, 2), ('SubmitEncryptedLog, 3)]
+makeLift ''Action
+
+data LogDatum = LogDatum
+    { logId           :: !BuiltinByteString
+    , requiredRole    :: !Role
+    , encryptedHash   :: !BuiltinByteString
+    , encryptionKeyId :: !BuiltinByteString
+    , timestamp       :: !Integer
+    } deriving (Show)
+makeIsDataIndexed ''LogDatum [('LogDatum, 0)]
+makeLift ''LogDatum
+
+data LogRedeemer = LogRedeemer
+    { action     :: !Action
+    , userPubKey :: !PubKeyHash
+    } deriving (Show)
+makeIsDataIndexed ''LogRedeemer [('LogRedeemer, 0)]
+makeLift ''LogRedeemer
+
+data EchoSafe
+instance Scripts.ValidatorTypes EchoSafe where
+    type instance DatumType EchoSafe = LogDatum
+    type instance RedeemerType EchoSafe = LogRedeemer
+
+type NFTTokenName = BuiltinByteString
+type NFTPolicyId = CurrencySymbol
+
+{-# INLINABLE mkValidator #-}
+mkValidator :: NFTPolicyId -> LogDatum -> LogRedeemer -> ScriptContext -> Bool
+mkValidator nftPolicyId datum redeemer ctx =
+    let info = scriptContextTxInfo ctx
+        ownInput = ownInput ctx
+        txOutputs = txInfoOutputs info
+        txSigners = txInfoSignatories info
+        logId' = logId datum
+        requiredRole' = requiredRole datum
+        encryptedHash' = encryptedHash datum
+        encryptionKeyId' = encryptionKeyId datum
+        timestamp' = timestamp datum
+        action' = action redeemer
+        userPubKey' = userPubKey redeemer
+    in
+        -- Validate signer
+        traceIfFalse "Invalid signer" (elem userPubKey' txSigners) &&
+        -- Validate timestamp
+        traceIfFalse "Expired timestamp" (timestamp' >= 1696115200) && -- Unix timestamp for 2023-10-01 as baseline
+        -- Check NFT and permissions
+        case action' of
+            ViewLog ->
+                traceIfFalse "Unauthorized view" ((requiredRole' == Helper || requiredRole' == Counselor || requiredRole' == Admin) &&
+                checkNFT nftPolicyId (roleToTokenName requiredRole') info) &&
+                logAccessAttempt logId' userPubKey' "view" info
+            ReplyLog ->
+                traceIfFalse "Unauthorized reply" ((requiredRole' == Counselor || requiredRole' == Admin) &&
+                checkNFT nftPolicyId (roleToTokenName requiredRole') info) &&
+                logAccessAttempt logId' userPubKey' "reply" info
+            UpgradeRole ->
+                traceIfFalse "Unauthorized upgrade" (requiredRole' == Admin &&
+                checkNFT nftPolicyId "AdminNFT" info) &&
+                checkRoleUpgradeOutput txOutputs nftPolicyId &&
+                logAccessAttempt logId' userPubKey' "upgrade" info
+            SubmitEncryptedLog ->
+                traceIfFalse "Invalid submission" ((requiredRole' == Helper || requiredRole' == Counselor || requiredRole' == Admin) &&
+                checkNFT nftPolicyId (roleToTokenName requiredRole') info &&
+                validateEncryptedHash encryptedHash') &&
+                logAccessAttempt logId' userPubKey' "submit" info
+
+checkNFT :: NFTPolicyId -> NFTTokenName -> TxInfo -> Bool
+checkNFT policyId tokenName info =
+    traceIfFalse "Missing NFT" (valueOf (txInfoInputsValue info) policyId tokenName >= 1)
+
+roleToTokenName :: Role -> NFTTokenName
+roleToTokenName Helper    = "HelperNFT"
+roleToTokenName Counselor = "CounselorNFT"
+roleToTokenName Admin     = "AdminNFT"
+
+validateEncryptedHash :: BuiltinByteString -> Bool
+validateEncryptedHash hash = traceIfFalse "Invalid hash length" (length hash == 64)
+
+logAccessAttempt :: BuiltinByteString -> PubKeyHash -> BuiltinByteString -> TxInfo -> Bool
+logAccessAttempt logId' userPubKey' action' info =
+    let metadata = txInfoData info
+    in
+        traceIfFalse "Missing metadata" (not (null metadata)) &&
+        all (\(k, v) -> (k == "logId" && v == logId') || (k == "action" && v == action') || (k == "user" && v == toByteString userPubKey')) metadata
+
+checkRoleUpgradeOutput :: [TxOut] -> NFTPolicyId -> Bool
+checkRoleUpgradeOutput outputs nftPolicyId =
+    traceIfFalse "No role upgrade" (any (\o -> valueOf (txOutValue o) nftPolicyId "CounselorNFT" >= 1 || valueOf (txOutValue o) nftPolicyId "AdminNFT" >= 1) outputs)
+
+typedValidator :: NFTPolicyId -> Scripts.TypedValidator EchoSafe
+typedValidator nftPolicyId = Scripts.mkTypedValidator @EchoSafe
+    ($$(PlutusTx.compile [|| mkValidator ||]) `PlutusTx.applyCode` PlutusTx.liftCode nftPolicyId)
+    $$(PlutusTx.compile [|| wrap ||])
+  where
+    wrap = Scripts.wrapValidator @LogDatum @LogRedeemer
+
+logAccess :: NFTPolicyId -> Contract () EchoSafeSchema Text ()
+logAccess nftPolicyId = do
+    userPubKey <- ownPaymentPubKeyHash
+    let validator = typedValidator nftPolicyId
+        validatorHash = Scripts.validatorHash validator
+    logInfo "Submitting log access transaction"
+    let datum = LogDatum { logId = "log123", requiredRole = Counselor, encryptedHash = "sampleHash64BytesLong", encryptionKeyId = "key123", timestamp = 1756668800 } -- Unix timestamp for 2025-08-31
+        redeemer = LogRedeemer { action = ViewLog, userPubKey = userPubKey }
+        lookups = Constraints.typedValidatorLookups validator
+        tx = Constraints.mustPayToTheScript datum (Ada.lovelaceValueOf 2000000) <>
+             Constraints.mustIncludeDatum (Datum $ toBuiltinData datum) <>
+             Constraints.mustIncludeMetadata [("logId", "log123"), ("action", "view"), ("user", toByteString userPubKey)]
+    ledgerTx <- submitTxConstraintsWith @EchoSafe lookups tx
+    logInfo "Transaction submitted"
+
+type EchoSafeSchema =
+        Endpoint "viewLog" LogDatum
+    .\/ Endpoint "replyLog" LogDatum
+    .\/ Endpoint "upgradeRole" LogDatum
+    .\/ Endpoint "submitEncryptedLog" LogDatum
