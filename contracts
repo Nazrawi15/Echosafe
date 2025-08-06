@@ -1,1 +1,28 @@
+{-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE TypeFamilies        #-}
+{-# LANGUAGE TypeOperators       #-}
 
+module EchoSafeAccessControl where
+
+import           Ledger                 hiding (singleton)
+import           Ledger.Typed.Scripts   as Scripts
+import           Ledger.Value           as Value
+import           Plutus.Contract        as Contract
+import           PlutusTx               hiding (txOutDatum)
+import           PlutusTx.Prelude       hiding (Semigroup, unless)
+import           Prelude                (Show)
+
+data Role = Helper | Counselor | Admin deriving (Show, Generic, FromJSON, ToJSON)
+makeIsDataIndexed ''Role [('Helper, 0), ('Counselor, 1), ('Admin, 2)]
+makeLift ''Role
+
+data Action = ViewLog | ReplyLog | UpgradeRole | SubmitEncryptedLog deriving (Show, Generic, FromJSON, ToJSON)
+makeIsDataIndexed ''Action [('ViewLog, 0), ('ReplyLog, 1), ('UpgradeRole, 2), ('SubmitEncryptedLog,
